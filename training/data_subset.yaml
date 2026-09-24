@@ -1,0 +1,7 @@
+path: /home/ajump/Projects/dtwhack/data/YOLO_DATA/CAW
+train: train_subset.txt
+val: val.txt
+test: test.txt
+names:
+  0: crop
+  1: weed
