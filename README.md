@@ -2,6 +2,16 @@
 
 YOLO26s object detection with two classes: `crop` and `weed`. The datasets live outside Git; training runs and MLflow history are kept in `training/`.
 
+## In-row navigation-label pilot
+
+[`pilot_data/row_decisions/`](pilot_data/row_decisions/) is a small, separately
+reviewed set of forward-facing TerraSentia frames. It explores a different
+question from the existing crop/weed detector: **does the visible row look open,
+weedy but traversable, crop-blocked, or overgrown?** The pilot has 49
+image-level labels across five recordings, with provenance and limitations in
+its [README](pilot_data/row_decisions/README.md). It is not a YOLO bounding-box
+dataset, a trained navigation model, or permission to drive autonomously.
+
 ## Layout
 
 - `scripts/convert_caw.py`, `scripts/convert_acre.py`: convert source annotations to YOLO boxes.
@@ -12,6 +22,8 @@ YOLO26s object detection with two classes: `crop` and `weed`. The datasets live 
 - `training/runs/`: checkpoints, metrics, and plots from completed runs.
 - `training/mlflow.db`, `training/mlartifacts/`: local MLflow run history.
 - `data/`: local datasets; ignored by Git. CAW and ACRE images and labels are **not** included in this repository.
+- `pilot_data/row_decisions/`: small versioned in-row image-level review set;
+  separate from the ignored YOLO datasets.
 
 ## Set up
 
