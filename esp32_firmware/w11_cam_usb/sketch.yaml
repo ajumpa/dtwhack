@@ -1,0 +1,5 @@
+# Board: XIAO ESP32S3 with OPI PSRAM and USB CDC On Boot (Serial = native USB).
+# Note: on this board CDCOnBoot=default means Enabled and CDCOnBoot=cdc means Disabled.
+# `arduino-cli compile` and `arduino-cli upload` in this folder use these defaults.
+default_fqbn: esp32:esp32:XIAO_ESP32S3:PSRAM=opi,USBMode=hwcdc,CDCOnBoot=default,DebugLevel=none
+default_port: /dev/ttyACM0
