@@ -8,7 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1] / "pilot_data" / "row_decisions"
 EXPECTED = Counter(
-    {"OPEN": 51, "WEEDS_CONTINUE": 6, "CROP_STOP": 4, "OVERGROWTH": 6}
+    {"OPEN": 57, "WEEDS_CONTINUE": 6, "CROP_STOP": 4, "OVERGROWTH": 6}
 )
 REQUIRED = {
     "image",

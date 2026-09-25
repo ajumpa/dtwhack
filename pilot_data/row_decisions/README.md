@@ -9,7 +9,7 @@ or invent YOLO bounding boxes for these frames.
 
 ## What's here
 
-- `images/`: 67 original 832 × 468 rectified left-camera JPEGs from five
+- `images/`: 73 original 832 × 468 rectified left-camera JPEGs from five
   TerraSentia ROS bag recordings. Only collaborator-approved frames are present.
 - `labels.csv`: one row per image, with the image-level label, crop, source
   recording, ROS timestamp (nanoseconds), review note, and SHA-256 checksum.
@@ -18,7 +18,7 @@ or invent YOLO bounding boxes for these frames.
 
 | Label | Count | Review meaning |
 | --- | ---: | --- |
-| `OPEN` | 51 | Visible row judged clear to continue. |
+| `OPEN` | 57 | Visible row judged clear to continue. |
 | `WEEDS_CONTINUE` | 6 | Vegetation judged to be weeds in the path; reviewer would continue. |
 | `CROP_STOP` | 4 | Apparent crop-in-path risk; reviewer would stop. |
 | `OVERGROWTH` | 6 | Dense/overhanging growth; the motion response is **undecided**. |
@@ -51,14 +51,15 @@ conservative motion policy.
    upscaling. Sampled frames about 8–10 seconds apart; searched the sweet-corn
    run more densely for difficult examples.
 3. Reviewed numbered contact sheets collaboratively, discarding out-of-row,
-   redundant, or unwanted frames. The latest sweet-corn review added 18 accepted
-   frames from the denser scan; frames explicitly marked for deletion were
-   excluded. The later, unreviewed sheet was not included.
+   redundant, or unwanted frames. An earlier sweet-corn review added 18 accepted
+   frames from the denser scan. A subsequent review added six `OPEN` frames
+   from the two cornfield runs and sweet corn. Frames explicitly marked for
+   deletion were excluded. The separate, unreviewed sweet-corn sheet was not included.
 4. Copied only accepted images and labels here. The original large `.bag` and
    `.svo` recordings, review sheets, and rejected frames are **not** included.
 
 There is no train/validation/test split here. Many frames from the same video
-are highly correlated, and the set is small and imbalanced (51/67 `OPEN`). A
+are highly correlated, and the set is small and imbalanced (57/73 `OPEN`). A
 random frame split would overstate generalization. If this proceeds beyond a
 hackathon demo, evaluate on separate recordings, days, fields, crop stages, and
 the actual SPV camera viewpoint. The TerraSentia camera's height and alignment
