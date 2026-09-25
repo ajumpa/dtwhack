@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
-"""Relay the ESP32 camera to the network as MJPEG over HTTP. Runs on the Pi.
+"""Relay the ESP32 camera as MJPEG over HTTP and receive drive commands. Runs on the Pi.
 
-Usage: python3 pi_server.py [/dev/ttyACM0] [port]
+Usage: python3 pi_server.py [/dev/ttyACM0] [http_port] [drive_port]    (defaults 8000, 9000)
   http://<pi>:8000/          page showing the live stream
   http://<pi>:8000/stream    MJPEG stream (browser <img>, cv2.VideoCapture)
   http://<pi>:8000/frame.jpg latest single frame
+  UDP port 9000              drive commands from dashboard.py
 
 The ESP32's JPEGs are forwarded unchanged; nothing is decoded here.
 Frame format is documented at the top of esp32_firmware/w11_cam_usb/w11_cam_usb.ino.
+
+Each drive packet is JSON: {"seq": 12, "l": 0.6, "r": -0.6}. l and r are the left and right
+motor speeds, from -1 (full reverse) to 1 (full forward). The dashboard repeats the command
+every 100 ms while a key is held, so if nothing arrives for DRIVE_TIMEOUT seconds (Wi-Fi lost,
+tab closed, laptop crashed) the motors stop. The motors aren't wired yet: Motors only prints.
+
 Standard library only.
 """
+import json
+import math
 import os
+import signal
+import socket
 import struct
 import sys
 import threading
@@ -22,6 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 MAGIC = b"\xA5\x5A\xCA\xFE"
 MAX_FRAME_BYTES = 512 * 1024
 BOUNDARY = "frame"
+DRIVE_TIMEOUT = 0.5  # seconds without a drive command before stopping
 
 PAGE = b"""<!doctype html>
 <title>Weedbot camera</title>
@@ -110,6 +122,64 @@ def reader(port, latest):
             os.close(fd)
 
 
+# ---- Drive commands ----------------------------------------------------------
+class Motors:
+    """Placeholder until the motor driver is chosen: prints changes instead of moving anything."""
+
+    def __init__(self):
+        self.left = self.right = None
+
+    def set(self, left, right, reason):
+        if (left, right) == (self.left, self.right):
+            return  # held keys repeat the same command 10 times a second
+        self.left, self.right = left, right
+        # Drive the real motors here once they are wired.
+        label = "STOP " if left == right == 0 else "drive"
+        print(f"{label}  L={left:+.2f} R={right:+.2f}   ({reason})", flush=True)
+
+
+def parse(packet):
+    """Return (left, right, seq) from a packet, or raise ValueError."""
+    try:
+        msg = json.loads(packet)
+        seq, left, right = int(msg["seq"]), float(msg["l"]), float(msg["r"])
+    except (ValueError, KeyError, TypeError) as e:
+        raise ValueError(f"bad packet {packet[:60]!r}") from e
+    if not all(math.isfinite(v) and -1 <= v <= 1 for v in (left, right)):
+        raise ValueError(f"speeds out of range: {packet[:60]!r}")
+    return left, right, seq
+
+
+def drive_listener(port, motors):
+    """Receive drive commands forever; stop the motors when they stop arriving."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    while True:
+        try:
+            sock.bind(("0.0.0.0", port))
+            break
+        except OSError as e:  # e.g. the old drive_server.py still running
+            print(f"waiting for UDP port {port}: {e.strerror}", flush=True)
+            time.sleep(2)
+    sock.settimeout(0.1)  # wake regularly to check the timeout
+    print(f"listening for drive commands on UDP port {port}", flush=True)
+
+    last_command = None  # time.monotonic() of the newest command; None once stopped by timeout
+    while True:
+        try:
+            packet, sender = sock.recvfrom(256)
+            left, right, seq = parse(packet)
+        except socket.timeout:
+            pass
+        except ValueError as e:
+            print(f"ignored packet from {sender[0]}: {e}", flush=True)
+        else:
+            motors.set(left, right, f"seq {seq} from {sender[0]}")
+            last_command = time.monotonic()
+        if last_command is not None and time.monotonic() - last_command > DRIVE_TIMEOUT:
+            motors.set(0, 0, f"no command for {DRIVE_TIMEOUT} s")
+            last_command = None
+
+
 # ---- HTTP -------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
     latest = None  # set in main()
@@ -165,14 +235,25 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     port = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyACM0"
     http_port = int(sys.argv[2]) if len(sys.argv) > 2 else 8000
+    drive_port = int(sys.argv[3]) if len(sys.argv) > 3 else 9000
 
+    motors = Motors()
+    motors.set(0, 0, "starting")
     Handler.latest = LatestFrame()
     threading.Thread(target=reader, args=(port, Handler.latest), daemon=True).start()
+    threading.Thread(target=drive_listener, args=(drive_port, motors), daemon=True).start()
 
     server = ThreadingHTTPServer(("0.0.0.0", http_port), Handler)
     server.daemon_threads = True
     print(f"serving on http://0.0.0.0:{http_port}/", flush=True)
-    server.serve_forever()
+    # systemd stops the service with SIGTERM; turn it into an exit so the motors stop below.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        motors.set(0, 0, "exiting")
 
 
 if __name__ == "__main__":

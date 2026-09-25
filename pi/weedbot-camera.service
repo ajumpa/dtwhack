@@ -1,14 +1,15 @@
 # Starts pi_server.py at boot and restarts it if it exits.
 # Install: see pi/README.md
 [Unit]
-Description=Weedbot camera relay (ESP32 USB -> MJPEG over HTTP)
+Description=Weedbot Pi server (ESP32 camera -> MJPEG over HTTP, dashboard drive commands -> motors)
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/python3 /opt/weedbot/pi_server.py /dev/ttyACM0 8000
+ExecStart=/usr/bin/python3 /opt/weedbot/pi_server.py /dev/ttyACM0 8000 9000
 Restart=always
 RestartSec=2
 # Throwaway system user with serial port access; no login account needed.
+# Once motors are wired to GPIO, this will also need access to /dev/gpiochip*.
 DynamicUser=yes
 SupplementaryGroups=dialout
 Environment=PYTHONUNBUFFERED=1

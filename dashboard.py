@@ -4,6 +4,7 @@
 Run: .venv/bin/python dashboard.py   (laptop joined to the weedbot hotspot)
 Then open http://127.0.0.1:8080. Ctrl+C stops the server.
 The stream comes from pi/pi_server.py (http://10.42.0.1:8000/stream); the Pi does no processing.
+WASD drive commands go to pi/pi_server.py as UDP packets (port 9000 on the same host).
 Viewing uses only the standard library. Detection requires ultralytics and runs on this machine.
 """
 import argparse
@@ -13,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
 from pathlib import Path
+import socket
 from threading import Condition, Lock, Thread
 import time
 from urllib.parse import parse_qs, urlsplit
@@ -30,8 +32,11 @@ BOUNDARY = "frame"
 class Dashboard:
     """Shared state: newest camera frame, stream health, detection settings and newest result."""
 
-    def __init__(self, stream_url, device):
+    def __init__(self, stream_url, device, drive_address):
         self.stream_url = stream_url
+        self.drive_address = drive_address
+        self.drive_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.drive_seq = 0
         self.device = device
         self.lock = Lock()
         self.new_frame = Condition(self.lock)
@@ -58,6 +63,15 @@ class Dashboard:
         with self.lock:
             self.new_frame.wait_for(lambda: self.seq > after_seq, timeout)
             return (self.seq, self.jpeg) if self.seq > after_seq else (after_seq, None)
+
+    def send_drive(self, left, right):
+        """Send one drive command to the Pi; returns its sequence number."""
+        with self.lock:
+            self.drive_seq += 1
+            seq = self.drive_seq
+        packet = json.dumps({'seq': seq, 'l': round(left, 3), 'r': round(right, 3)}).encode()
+        self.drive_socket.sendto(packet, self.drive_address)
+        return seq
 
     def status(self):
         with self.lock:
@@ -152,18 +166,25 @@ PAGE = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Weedbot dashboard</title>
 <style>
-body{margin:0;background:#15191e;color:#eef2f6;font:15px system-ui}header{padding:16px 22px;background:#222933}h1{font-size:20px;margin:0 0 12px}.controls{display:flex;flex-wrap:wrap;align-items:center;gap:12px}select,input{font:inherit;padding:6px;border-radius:5px;border:1px solid #637080;background:#303a47;color:white}input[type=number]{width:85px}label{white-space:nowrap}
+body{margin:0;background:#15191e;color:#eef2f6;font:15px system-ui}header{padding:16px 22px;background:#222933}h1{font-size:20px;margin:0 0 12px}.controls{display:flex;flex-wrap:wrap;align-items:center;gap:12px}select,input,button{font:inherit;padding:6px;border-radius:5px;border:1px solid #637080;background:#303a47;color:white}input[type=number]{width:85px}input[type=range]{vertical-align:middle;padding:0}button{cursor:pointer}#drive{font-variant-numeric:tabular-nums;color:#bec9d5}#drive.moving{color:#39ff88}label{white-space:nowrap}
 #status{margin-top:12px;min-height:24px}.dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#ff6b6b;margin-right:6px}.dot.live{background:#39ff88}#error{color:#ff9696;white-space:pre-wrap}small{color:#bec9d5}.crop{color:#39ff88}.weed{color:#ffb340}
 main{padding:16px;max-width:1100px;margin:0 auto}[hidden]{display:none!important}section{background:#1d232b;border-radius:8px;padding:12px}h2{display:inline-block;font-size:16px;margin:0 0 10px;font-weight:600}h2 span{font-weight:400;color:#bec9d5}img,canvas{display:block;max-width:100%;max-height:calc(100vh - 230px);width:auto;height:auto;margin:0 auto;background:#000;border-radius:4px}</style></head>
 <body><header><h1>Weedbot dashboard</h1><div class="controls">
 <label><input id="detect" type="checkbox">Detection</label><label>Model <select id="model"></select></label><label>Confidence <input id="confidence" type="number" min="0.01" max="1" step="0.05" value="0.25"></label>
-<label><input id="crop" type="checkbox" checked><span class="crop">Crop</span></label><label><input id="weed" type="checkbox" checked><span class="weed">Weed</span></label><label><input id="names" type="checkbox" checked>Labels</label></div>
+<label><input id="crop" type="checkbox" checked><span class="crop">Crop</span></label><label><input id="weed" type="checkbox" checked><span class="weed">Weed</span></label><label><input id="names" type="checkbox" checked>Labels</label>
+<label>Speed <input id="speed" type="range" min="0.1" max="1" step="0.1" value="0.5"></label><button id="stop" type="button">Stop</button><span id="drive">Stopped</span></div>
 <div id="status"><span class="dot" id="dot"></span><span id="streamStatus">Connecting…</span></div><div id="error" role="alert"></div>
-<small>Detection off: live camera. Detection on: each frame the model finished, with its boxes; it updates as fast as detection runs. D: toggle detection.</small></header>
+<small>Detection off: live camera. Detection on: each frame the model finished, with its boxes; it updates as fast as detection runs. Drive: W/S forward/back, A/D turn, Space stop. T: toggle detection.</small></header>
 <main><section><h2 id="title">Live camera</h2> <h2><span id="viewStatus"></span></h2><img id="live" src="/stream" alt="Live camera stream"><canvas id="canvas" width="640" height="480" hidden></canvas></section></main>
 <script>
 const $=id=>document.getElementById(id);let resultSeq=0,picture=null,boxes=[],detectStatus='off',size='';
 async function api(path){const r=await fetch(path);const data=await r.json();if(!r.ok)throw Error(data.error||r.statusText);return data;}
+// Drive: held keys -> left/right speeds. Commands repeat every 100 ms while a key is held; the Pi stops the motors after 0.5 s without one.
+const DRIVE_KEYS=new Set(['w','a','s','d']),held=new Set();let sending=false,pending=false;
+function driveValues(){const throttle=held.has('w')-held.has('s'),turn=held.has('d')-held.has('a'),speed=Number($('speed').value),clamp=x=>Math.max(-1,Math.min(1,x));return [clamp(throttle+turn)*speed,clamp(throttle-turn)*speed];}
+async function drive(){pending=true;if(sending)return;sending=true;while(pending){pending=false;const [l,r]=driveValues();const moving=l!==0||r!==0;$('drive').textContent=moving?`L ${l.toFixed(2)}  R ${r.toFixed(2)}`:'Stopped';$('drive').classList.toggle('moving',moving);
+try{await api('/api/drive?'+new URLSearchParams({l:l.toFixed(3),r:r.toFixed(3)}));}catch(e){$('error').textContent=e.message;}}sending=false;}
+function stop(){held.clear();drive();}
 function draw(){const c=$('canvas'),ctx=c.getContext('2d');if(!picture){ctx.fillStyle='#000';ctx.fillRect(0,0,c.width,c.height);return;}c.width=picture.naturalWidth;c.height=picture.naturalHeight;ctx.drawImage(picture,0,0);const scale=Math.max(1,c.width/900);ctx.lineWidth=2*scale;ctx.font=`bold ${14*scale}px system-ui`;
 for(const [cls,x,y,w,h,score] of boxes){if(!$(cls===0?'crop':'weed').checked)continue;const left=(x-w/2)*c.width,top=(y-h/2)*c.height,color=cls===0?'#39ff88':'#ffb340';ctx.strokeStyle=color;ctx.strokeRect(left,top,w*c.width,h*c.height);if($('names').checked){const label=(cls===0?'crop ':'weed ')+score.toFixed(2),tw=ctx.measureText(label).width+8*scale,th=19*scale,lx=Math.min(left,c.width-tw),ly=Math.max(th,top);ctx.fillStyle=color;ctx.fillRect(lx,ly-th,tw,th);ctx.fillStyle='#111';ctx.fillText(label,lx+4*scale,ly-4*scale);}}}
 function view(){const detecting=$('detect').checked&&picture!==null;$('live').hidden=detecting;$('canvas').hidden=!detecting;$('title').textContent=detecting?'Detections':'Live camera';if(detecting){const crops=boxes.filter(b=>b[0]===0).length;$('viewStatus').textContent=`${detectStatus} · ${crops} crop / ${boxes.length-crops} weed`;}else $('viewStatus').textContent=[size,$('detect').checked?detectStatus:''].filter(Boolean).join(' · ');}
@@ -172,7 +193,9 @@ async function poll(){try{const s=await api('/api/status');$('error').textConten
 if(!$('model').options.length){for(const name of s.models){const o=document.createElement('option');o.value=name;o.textContent=name;$('model').appendChild(o);}$('model').value=s.model;$('confidence').value=s.confidence;}
 if(document.activeElement!==$('detect')&&$('detect').checked!==s.detect){$('detect').checked=s.detect;picture=null;}if(!s.detect||s.result_seq===resultSeq)detectStatus=s.detect_status;view();if(s.detect&&s.result_seq!==resultSeq)await loadResult();}catch(e){$('dot').classList.remove('live');$('streamStatus').textContent='Dashboard server not responding';$('error').textContent=e.message;}}
 async function settings(){const confidence=Number($('confidence').value);if(!(confidence>0&&confidence<=1)){$('error').textContent='Confidence must be between 0 and 1.';return;}try{await api('/api/settings?'+new URLSearchParams({detect:$('detect').checked?1:0,model:$('model').value,conf:confidence}));}catch(e){$('error').textContent=e.message;}}
-$('detect').onchange=()=>{picture=null;view();settings();};document.addEventListener('keydown',e=>{if(['INPUT','SELECT'].includes(e.target.tagName)&&e.target.type!=='checkbox')return;if(e.key.toLowerCase()==='d'){$('detect').checked=!$('detect').checked;$('detect').onchange();}});$('model').onchange=settings;$('confidence').onchange=settings;for(const id of ['crop','weed','names'])$(id).onchange=draw;
+$('detect').onchange=()=>{picture=null;view();settings();};document.addEventListener('keydown',e=>{if(e.target.tagName==='SELECT'||e.target.type==='number')return;const k=e.key.toLowerCase();if(DRIVE_KEYS.has(k)){e.preventDefault();if(!held.has(k)){held.add(k);drive();}}else if(k===' '){e.preventDefault();stop();}else if(k==='t'){$('detect').checked=!$('detect').checked;$('detect').onchange();}});
+document.addEventListener('keyup',e=>{if(held.delete(e.key.toLowerCase()))drive();});window.addEventListener('blur',stop);document.addEventListener('visibilitychange',()=>{if(document.hidden)stop();});$('stop').onclick=stop;$('speed').onchange=()=>{if(held.size)drive();};
+setInterval(()=>{if(held.size)drive();},100);$('model').onchange=settings;$('confidence').onchange=settings;for(const id of ['crop','weed','names'])$(id).onchange=draw;
 $('live').onload=()=>{size=`${$('live').naturalWidth} × ${$('live').naturalHeight}`;view();};$('live').onerror=()=>setTimeout(()=>{$('live').src='/stream?'+Date.now();},1000);
 draw();poll();setInterval(poll,250);
 </script></body></html>'''
@@ -241,6 +264,16 @@ class Handler(BaseHTTPRequestHandler):
                     self.state.model_name, self.state.confidence = model_name, confidence
                     self.state.detect_status = 'starting…' if self.state.detect else 'off'
                 self.respond({'ok': True})
+            elif url.path == '/api/drive':
+                left, right = (float(params.get(key, ['0'])[0]) for key in ('l', 'r'))
+                if not all(math.isfinite(v) and -1 <= v <= 1 for v in (left, right)):
+                    raise ValueError('Drive speeds must be between -1 and 1')
+                try:
+                    seq = self.state.send_drive(left, right)
+                except OSError as exc:  # e.g. laptop not on the hotspot
+                    self.respond({'error': f'Cannot send drive command: {exc}'}, status=502)
+                else:
+                    self.respond({'ok': True, 'seq': seq})
             else:
                 self.respond({'error': 'Not found'}, status=404)
         except ValueError as exc:
@@ -252,6 +285,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--pi', default='http://10.42.0.1:8000/stream', help='MJPEG stream served by pi/pi_server.py')
+    parser.add_argument('--drive-port', type=int, default=9000, help='UDP drive port of pi/pi_server.py, on the --pi host')
     parser.add_argument('--port', type=int, default=8080)
     # The GTX 1050 (sm_61) needs a CUDA 12.6 torch build; CUDA 12.8+ builds dropped Pascal.
     parser.add_argument('--device', default='auto', help='Inference device: auto (first GPU if available, else cpu), cpu, 0, ...')
@@ -259,7 +293,7 @@ def main():
     args = parser.parse_args()
     device = int(args.device) if args.device.isdigit() else args.device
 
-    state = Dashboard(args.pi, device)
+    state = Dashboard(args.pi, device, (urlsplit(args.pi).hostname, args.drive_port))
     Thread(target=read_stream, args=(state,), daemon=True).start()
     Thread(target=run_detection, args=(state,), daemon=True).start()
     try:
@@ -268,7 +302,7 @@ def main():
         parser.exit(1, f'Cannot start dashboard: {exc}. Try --port 8081.\n')
     server.daemon_threads = True
     url = f'http://127.0.0.1:{server.server_port}'
-    print(f'Dashboard: {url}\nCamera: {args.pi}\nPress Ctrl+C to stop.', flush=True)
+    print(f'Dashboard: {url}\nCamera: {args.pi}\nDrive: udp://{state.drive_address[0]}:{args.drive_port}\nPress Ctrl+C to stop.', flush=True)
     if args.open_browser:
         webbrowser.open(url)
     try:

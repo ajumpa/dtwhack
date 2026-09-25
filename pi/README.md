@@ -1,6 +1,7 @@
 # Pi camera relay
 
-The Pi runs a Wi-Fi hotspot and relays the ESP32 camera (USB, `/dev/ttyACM0`) as MJPEG over HTTP.
+The Pi runs a Wi-Fi hotspot, relays the ESP32 camera (USB, `/dev/ttyACM0`) as MJPEG over HTTP,
+and receives WASD drive commands from the dashboard (section 4).
 The Pi does no image processing; detection and display happen on the laptop.
 
 ## 1. Hotspot (once)
@@ -85,8 +86,32 @@ Join the `weedbot` Wi-Fi (password `ajumpahotspot`), then open <http://10.42.0.1
 | `/stream` | MJPEG stream, also readable with `cv2.VideoCapture("http://10.42.0.1:8000/stream")` |
 | `/frame.jpg` | latest single frame |
 
+## 4. Drive commands (WASD)
+
+`pi_server.py` also listens for drive commands from `dashboard.py`: UDP packets on port 9000.
+If no command arrives for 0.5 s, it stops the motors. The motors aren't wired yet: for now it prints
+each change, visible with `journalctl -u weedbot-camera -f`.
+
+Run `dashboard.py` on the laptop and drive with W/A/S/D (Space stops). The Pi prints lines like
+`drive  L=+0.50 R=+0.50   (seq 12 from 10.42.0.x)`. Checks:
+
+1. Hold W: one `drive` line. Release: `STOP` right away.
+2. Hold W and click another window: `STOP`.
+3. Hold W and turn off the laptop's Wi-Fi: `STOP ... (no command for 0.5 s)`.
+
+If nothing prints, check that the dashboard shows `Drive: udp://10.42.0.1:9000` at startup, and
+`sudo ufw status` on the Pi (UDP 9000 must be allowed if the firewall is on).
+
 ## Updating
+
+After changing `pi_server.py`:
 
 ```bash
 scp pi/pi_server.py ajumpa@10.42.0.1:~ && ssh ajumpa@10.42.0.1 'sudo mv ~/pi_server.py /opt/weedbot/ && sudo systemctl restart weedbot-camera'
+```
+
+After changing `weedbot-camera.service`:
+
+```bash
+scp pi/weedbot-camera.service ajumpa@10.42.0.1:~ && ssh ajumpa@10.42.0.1 'sudo mv ~/weedbot-camera.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl restart weedbot-camera'
 ```
