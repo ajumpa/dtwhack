@@ -7,7 +7,7 @@ YOLO26s object detection with two classes: `crop` and `weed`. The datasets live 
 [`pilot_data/row_decisions/`](pilot_data/row_decisions/) is a small, separately
 reviewed set of forward-facing TerraSentia frames. It explores a different
 question from the existing crop/weed detector: **does the visible row look open,
-weedy but traversable, crop-blocked, or overgrown?** The pilot has 49
+weedy but traversable, crop-blocked, or overgrown?** The pilot has 67
 image-level labels across five recordings, with provenance and limitations in
 its [README](pilot_data/row_decisions/README.md). It is not a YOLO bounding-box
 dataset, a trained navigation model, or permission to drive autonomously.
