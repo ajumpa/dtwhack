@@ -64,13 +64,12 @@ class Dashboard:
             self.new_frame.wait_for(lambda: self.seq > after_seq, timeout)
             return (self.seq, self.jpeg) if self.seq > after_seq else (after_seq, None)
 
-    def send_drive(self, left, right):
-        """Send one drive command to the Pi; returns its sequence number."""
+    def send_drive(self, speeds):
+        """Send one drive command to the Pi ({'l': .., 'r': ..} or {'m': [...]}); returns its sequence number."""
         with self.lock:
             self.drive_seq += 1
             seq = self.drive_seq
-        packet = json.dumps({'seq': seq, 'l': round(left, 3), 'r': round(right, 3)}).encode()
-        self.drive_socket.sendto(packet, self.drive_address)
+        self.drive_socket.sendto(json.dumps({'seq': seq, **speeds}).encode(), self.drive_address)
         return seq
 
     def status(self):
@@ -172,18 +171,19 @@ main{padding:16px;max-width:1100px;margin:0 auto}[hidden]{display:none!important
 <body><header><h1>Weedbot dashboard</h1><div class="controls">
 <label><input id="detect" type="checkbox">Detection</label><label>Model <select id="model"></select></label><label>Confidence <input id="confidence" type="number" min="0.01" max="1" step="0.05" value="0.25"></label>
 <label><input id="crop" type="checkbox" checked><span class="crop">Crop</span></label><label><input id="weed" type="checkbox" checked><span class="weed">Weed</span></label><label><input id="names" type="checkbox" checked>Labels</label>
-<label>Speed <input id="speed" type="range" min="0.1" max="1" step="0.1" value="0.5"></label><button id="stop" type="button">Stop</button><span id="drive">Stopped</span></div>
+<label>Speed <input id="speed" type="range" min="0.1" max="1" step="0.1" value="0.5"></label><label><input id="motorTest" type="checkbox">Motor test</label><button id="stop" type="button">Stop</button><span id="drive">Stopped</span></div>
 <div id="status"><span class="dot" id="dot"></span><span id="streamStatus">Connecting…</span></div><div id="error" role="alert"></div>
-<small>Detection off: live camera. Detection on: each frame the model finished, with its boxes; it updates as fast as detection runs. Drive: W/S forward/back, A/D turn, Space stop. T: toggle detection.</small></header>
+<small>Detection off: live camera. Detection on: each frame the model finished, with its boxes; it updates as fast as detection runs. Drive: W forward, S back, A pivot left, D pivot right, Space stop. Motor test: W/A/S/D run motors M1/M2/M3/M4 forward, each on its own. T: toggle detection.</small></header>
 <main><section><h2 id="title">Live camera</h2> <h2><span id="viewStatus"></span></h2><img id="live" src="/stream" alt="Live camera stream"><canvas id="canvas" width="640" height="480" hidden></canvas></section></main>
 <script>
 const $=id=>document.getElementById(id);let resultSeq=0,picture=null,boxes=[],detectStatus='off',size='';
 async function api(path){const r=await fetch(path);const data=await r.json();if(!r.ok)throw Error(data.error||r.statusText);return data;}
 // Drive: held keys -> left/right speeds. Commands repeat every 100 ms while a key is held; the Pi stops the motors after 0.5 s without one.
 const DRIVE_KEYS=new Set(['w','a','s','d']),held=new Set();let sending=false,pending=false;
-function driveValues(){const throttle=held.has('w')-held.has('s'),turn=held.has('d')-held.has('a'),speed=Number($('speed').value),clamp=x=>Math.max(-1,Math.min(1,x));return [clamp(throttle+turn)*speed,clamp(throttle-turn)*speed];}
-async function drive(){pending=true;if(sending)return;sending=true;while(pending){pending=false;const [l,r]=driveValues();const moving=l!==0||r!==0;$('drive').textContent=moving?`L ${l.toFixed(2)}  R ${r.toFixed(2)}`:'Stopped';$('drive').classList.toggle('moving',moving);
-try{await api('/api/drive?'+new URLSearchParams({l:l.toFixed(3),r:r.toFixed(3)}));}catch(e){$('error').textContent=e.message;}}sending=false;}
+function driveCommand(){const speed=Number($('speed').value);if($('motorTest').checked){const m=['w','a','s','d'].map(k=>held.has(k)?speed:0);return {params:{m:m.map(v=>v.toFixed(3)).join(',')},moving:m.some(v=>v!==0),text:m.map((v,i)=>`M${i+1} ${v.toFixed(2)}`).join('  ')};}
+const throttle=held.has('w')-held.has('s'),turn=held.has('d')-held.has('a'),clamp=x=>Math.max(-1,Math.min(1,x)),l=clamp(throttle+turn)*speed,r=clamp(throttle-turn)*speed;return {params:{l:l.toFixed(3),r:r.toFixed(3)},moving:l!==0||r!==0,text:`L ${l.toFixed(2)}  R ${r.toFixed(2)}`};}
+async function drive(){pending=true;if(sending)return;sending=true;while(pending){pending=false;const c=driveCommand();$('drive').textContent=c.moving?c.text:'Stopped';$('drive').classList.toggle('moving',c.moving);
+try{await api('/api/drive?'+new URLSearchParams(c.params));}catch(e){$('error').textContent=e.message;}}sending=false;}
 function stop(){held.clear();drive();}
 function draw(){const c=$('canvas'),ctx=c.getContext('2d');if(!picture){ctx.fillStyle='#000';ctx.fillRect(0,0,c.width,c.height);return;}c.width=picture.naturalWidth;c.height=picture.naturalHeight;ctx.drawImage(picture,0,0);const scale=Math.max(1,c.width/900);ctx.lineWidth=2*scale;ctx.font=`bold ${14*scale}px system-ui`;
 for(const [cls,x,y,w,h,score] of boxes){if(!$(cls===0?'crop':'weed').checked)continue;const left=(x-w/2)*c.width,top=(y-h/2)*c.height,color=cls===0?'#39ff88':'#ffb340';ctx.strokeStyle=color;ctx.strokeRect(left,top,w*c.width,h*c.height);if($('names').checked){const label=(cls===0?'crop ':'weed ')+score.toFixed(2),tw=ctx.measureText(label).width+8*scale,th=19*scale,lx=Math.min(left,c.width-tw),ly=Math.max(th,top);ctx.fillStyle=color;ctx.fillRect(lx,ly-th,tw,th);ctx.fillStyle='#111';ctx.fillText(label,lx+4*scale,ly-4*scale);}}}
@@ -194,7 +194,7 @@ if(!$('model').options.length){for(const name of s.models){const o=document.crea
 if(document.activeElement!==$('detect')&&$('detect').checked!==s.detect){$('detect').checked=s.detect;picture=null;}if(!s.detect||s.result_seq===resultSeq)detectStatus=s.detect_status;view();if(s.detect&&s.result_seq!==resultSeq)await loadResult();}catch(e){$('dot').classList.remove('live');$('streamStatus').textContent='Dashboard server not responding';$('error').textContent=e.message;}}
 async function settings(){const confidence=Number($('confidence').value);if(!(confidence>0&&confidence<=1)){$('error').textContent='Confidence must be between 0 and 1.';return;}try{await api('/api/settings?'+new URLSearchParams({detect:$('detect').checked?1:0,model:$('model').value,conf:confidence}));}catch(e){$('error').textContent=e.message;}}
 $('detect').onchange=()=>{picture=null;view();settings();};document.addEventListener('keydown',e=>{if(e.target.tagName==='SELECT'||e.target.type==='number')return;const k=e.key.toLowerCase();if(DRIVE_KEYS.has(k)){e.preventDefault();if(!held.has(k)){held.add(k);drive();}}else if(k===' '){e.preventDefault();stop();}else if(k==='t'){$('detect').checked=!$('detect').checked;$('detect').onchange();}});
-document.addEventListener('keyup',e=>{if(held.delete(e.key.toLowerCase()))drive();});window.addEventListener('blur',stop);document.addEventListener('visibilitychange',()=>{if(document.hidden)stop();});$('stop').onclick=stop;$('speed').onchange=()=>{if(held.size)drive();};
+document.addEventListener('keyup',e=>{if(held.delete(e.key.toLowerCase()))drive();});window.addEventListener('blur',stop);document.addEventListener('visibilitychange',()=>{if(document.hidden)stop();});$('stop').onclick=stop;$('motorTest').onchange=stop;$('speed').onchange=()=>{if(held.size)drive();};
 setInterval(()=>{if(held.size)drive();},100);$('model').onchange=settings;$('confidence').onchange=settings;for(const id of ['crop','weed','names'])$(id).onchange=draw;
 $('live').onload=()=>{size=`${$('live').naturalWidth} × ${$('live').naturalHeight}`;view();};$('live').onerror=()=>setTimeout(()=>{$('live').src='/stream?'+Date.now();},1000);
 draw();poll();setInterval(poll,250);
@@ -265,11 +265,16 @@ class Handler(BaseHTTPRequestHandler):
                     self.state.detect_status = 'starting…' if self.state.detect else 'off'
                 self.respond({'ok': True})
             elif url.path == '/api/drive':
-                left, right = (float(params.get(key, ['0'])[0]) for key in ('l', 'r'))
-                if not all(math.isfinite(v) and -1 <= v <= 1 for v in (left, right)):
+                if 'm' in params:  # motor test: one speed per motor
+                    values = [float(v) for v in params['m'][0].split(',')]
+                    speeds = {'m': [round(v, 3) for v in values]}
+                else:
+                    values = [float(params.get(key, ['0'])[0]) for key in ('l', 'r')]
+                    speeds = {'l': round(values[0], 3), 'r': round(values[1], 3)}
+                if not all(math.isfinite(v) and -1 <= v <= 1 for v in values):
                     raise ValueError('Drive speeds must be between -1 and 1')
                 try:
-                    seq = self.state.send_drive(left, right)
+                    seq = self.state.send_drive(speeds)
                 except OSError as exc:  # e.g. laptop not on the hotspot
                     self.respond({'error': f'Cannot send drive command: {exc}'}, status=502)
                 else:

@@ -11,12 +11,20 @@ The ESP32's JPEGs are forwarded unchanged; nothing is decoded here.
 Frame format is documented at the top of esp32_firmware/w11_cam_usb/w11_cam_usb.ino.
 
 Each drive packet is JSON: {"seq": 12, "l": 0.6, "r": -0.6}. l and r are the left and right
-motor speeds, from -1 (full reverse) to 1 (full forward). The dashboard repeats the command
+side speeds, from -1 (full reverse) to 1 (full forward); each motor follows its side in MOTORS.
+The dashboard's motor test sends {"seq": 12, "m": [m1, m2, m3, m4]} instead: one speed per motor. The dashboard repeats the command
 every 100 ms while a key is held, so if nothing arrives for DRIVE_TIMEOUT seconds (Wi-Fi lost,
-tab closed, laptop crashed) the motors stop. The motors aren't wired yet: Motors only prints.
+tab closed, laptop crashed) the motors stop.
+
+Motors are 28BYJ-48 steppers on ULN2003 boards, driven through the Linux GPIO character device
+(/dev/gpiochip*). That needs root (or access to the device); without it the server still runs
+the camera and only prints drive commands.
 
 Standard library only.
 """
+import ctypes
+import fcntl
+import glob
 import json
 import math
 import os
@@ -123,31 +131,202 @@ def reader(port, latest):
 
 
 # ---- Drive commands ----------------------------------------------------------
+# Stepper wiring: BCM GPIO numbers for IN1..IN4 of each ULN2003 board, the side it follows
+# ("l" or "r"), and invert to flip a motor that turns the wrong way. The back motors are
+# inverted: on each side, front and back spin in opposite directions to move the robot.
+# Same controls as the SPV sketch: W forward (both sides forward), S back, A pivot left
+# (left side back, right side forward), D pivot right; releasing the keys stops with all coils off.
+MOTORS = {
+    "M1": {"pins": (5, 6, 13, 19), "side": "l", "invert": False},    # front left
+    "M2": {"pins": (12, 16, 20, 21), "side": "r", "invert": False},  # front right
+    "M3": {"pins": (22, 23, 24, 25), "side": "l", "invert": True},   # back left
+    "M4": {"pins": (4, 18, 26, 27), "side": "r", "invert": True},    # back right
+}
+MAX_STEP_RATE = 500.0  # full steps/s at speed 1.0 (28BYJ-48: ~2048 per turn, so ~15 RPM); lower if it buzzes
+START_RATE = 200.0     # full steps/s to start from; faster starts can stall
+ACCEL = 1200.0         # full steps/s per second when speeding up
+DEADBAND = 0.05        # speeds below this count as stop
+# Full-step, two coils on (more torque and ~2x the speed of half-stepping), IN1..IN4.
+# Two coils draw ~200 mA per motor while moving; on the Pi's 5 V pin, watch for brownouts.
+STEPS = [int(bits[::-1], 2) for bits in ("1100", "0110", "0011", "1001")]
+GPIO_CHIP_LABEL = "pinctrl-rp1"  # Pi 5 header GPIOs; gpiochip number varies by kernel
+
+
+# Linux GPIO character device, uAPI v2 (include/uapi/linux/gpio.h).
+class _ChipInfo(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_char * 32), ("label", ctypes.c_char * 32), ("lines", ctypes.c_uint32)]
+
+
+class _LineAttribute(ctypes.Structure):
+    _fields_ = [("id", ctypes.c_uint32), ("padding", ctypes.c_uint32), ("value", ctypes.c_uint64)]
+
+
+class _LineConfigAttribute(ctypes.Structure):
+    _fields_ = [("attr", _LineAttribute), ("mask", ctypes.c_uint64)]
+
+
+class _LineConfig(ctypes.Structure):
+    _fields_ = [("flags", ctypes.c_uint64), ("num_attrs", ctypes.c_uint32), ("padding", ctypes.c_uint32 * 5),
+                ("attrs", _LineConfigAttribute * 10)]
+
+
+class _LineRequest(ctypes.Structure):
+    _fields_ = [("offsets", ctypes.c_uint32 * 64), ("consumer", ctypes.c_char * 32), ("config", _LineConfig),
+                ("num_lines", ctypes.c_uint32), ("event_buffer_size", ctypes.c_uint32),
+                ("padding", ctypes.c_uint32 * 5), ("fd", ctypes.c_int32)]
+
+
+class _LineValues(ctypes.Structure):
+    _fields_ = [("bits", ctypes.c_uint64), ("mask", ctypes.c_uint64)]
+
+
+def _iowr(nr, struct_type, read_only=False):
+    return ((2 if read_only else 3) << 30) | (ctypes.sizeof(struct_type) << 16) | (0xB4 << 8) | nr
+
+
+GPIO_GET_CHIPINFO_IOCTL = _iowr(0x01, _ChipInfo, read_only=True)
+GPIO_V2_GET_LINE_IOCTL = _iowr(0x07, _LineRequest)
+GPIO_V2_LINE_SET_VALUES_IOCTL = _iowr(0x0F, _LineValues)
+GPIO_V2_LINE_FLAG_OUTPUT = 1 << 3
+
+
+def find_gpio_chip(label=GPIO_CHIP_LABEL):
+    """Return the /dev/gpiochipN path whose label matches."""
+    labels = []
+    for path in sorted(glob.glob("/dev/gpiochip*")):
+        fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
+        try:
+            info = _ChipInfo()
+            fcntl.ioctl(fd, GPIO_GET_CHIPINFO_IOCTL, info)
+        finally:
+            os.close(fd)
+        if info.label.decode() == label:
+            return path
+        labels.append(f"{path}={info.label.decode()}")
+    raise OSError(f"no GPIO chip labelled {label} (found: {', '.join(labels) or 'none'})")
+
+
+class GpioOutputs:
+    """A group of GPIO output lines, all set together with one bitmask (bit i = offsets[i])."""
+
+    def __init__(self, chip_path, offsets, consumer):
+        request = _LineRequest()
+        for i, offset in enumerate(offsets):
+            request.offsets[i] = offset
+        request.num_lines = len(offsets)
+        request.consumer = consumer.encode()[:31]
+        request.config.flags = GPIO_V2_LINE_FLAG_OUTPUT  # lines start low
+        chip = os.open(chip_path, os.O_RDWR | os.O_CLOEXEC)
+        try:
+            fcntl.ioctl(chip, GPIO_V2_GET_LINE_IOCTL, request)
+        finally:
+            os.close(chip)  # the line request keeps its own file descriptor
+        self.fd = request.fd
+        self.mask = (1 << len(offsets)) - 1
+
+    def write(self, bits):
+        fcntl.ioctl(self.fd, GPIO_V2_LINE_SET_VALUES_IOCTL, _LineValues(bits, self.mask))
+
+
+class Stepper:
+    """One 28BYJ-48 on a ULN2003 board, stepped by its own thread; set_speed() only sets the target."""
+
+    def __init__(self, outputs, invert):
+        self.outputs, self.invert = outputs, invert
+        self.cond = threading.Condition()
+        self.target = 0.0  # signed full steps/s
+        self.phase = 0
+        outputs.write(0)
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def set_speed(self, speed):
+        """speed from -1 to 1. Stopping de-energizes the coils immediately, not on the next step."""
+        rate = 0.0 if abs(speed) < DEADBAND else speed * MAX_STEP_RATE * (-1 if self.invert else 1)
+        with self.cond:
+            self.target = rate
+            if rate == 0:
+                self.outputs.write(0)  # holding the coils on draws ~250 mA and heats the motor
+            self.cond.notify()
+
+    def _run(self):
+        rate, next_step = 0.0, time.monotonic()
+        while True:
+            with self.cond:
+                if self.target == 0:
+                    rate = 0.0
+                    self.cond.wait_for(lambda: self.target != 0)
+                    next_step = time.monotonic()
+                target = self.target
+                if rate == 0 or (rate > 0) != (target > 0):
+                    rate = math.copysign(min(START_RATE, abs(target)), target)  # start or reverse
+                elif abs(rate) < abs(target):
+                    rate = math.copysign(min(abs(target), abs(rate) + ACCEL / abs(rate)), target)
+                else:
+                    rate = target  # slowing down needs no ramp
+                # Stepping happens under the lock, so a stop can't be overwritten by a late step.
+                self.phase = (self.phase + (1 if rate > 0 else -1)) % len(STEPS)
+                self.outputs.write(STEPS[self.phase])
+            next_step += 1 / abs(rate)
+            delay = next_step - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            elif delay < -0.05:
+                next_step = time.monotonic()  # fell well behind; don't try to catch up in a burst
+
+
 class Motors:
-    """Placeholder until the motor driver is chosen: prints changes instead of moving anything."""
+    """All steppers in MOTORS. Prints each change; drives the motors when GPIO is reachable."""
 
     def __init__(self):
-        self.left = self.right = None
+        self.speeds = None
+        self.lock = threading.Lock()
+        self.steppers = {}
+        try:
+            chip = find_gpio_chip()
+            for name, motor in MOTORS.items():
+                self.steppers[name] = Stepper(GpioOutputs(chip, motor["pins"], f"weedbot-{name}"), motor["invert"])
+            print(f"motors on {chip}: {', '.join(self.steppers)}", flush=True)
+        except OSError as e:
+            print(f"no motor output, printing drive commands only: {e}", flush=True)
 
     def set(self, left, right, reason):
-        if (left, right) == (self.left, self.right):
-            return  # held keys repeat the same command 10 times a second
-        self.left, self.right = left, right
-        # Drive the real motors here once they are wired.
-        label = "STOP " if left == right == 0 else "drive"
-        print(f"{label}  L={left:+.2f} R={right:+.2f}   ({reason})", flush=True)
+        """Tank driving: each motor runs at its side's speed."""
+        speeds = {name: left if motor["side"] == "l" else right for name, motor in MOTORS.items()}
+        self._apply(speeds, f"L={left:+.2f} R={right:+.2f}", reason)
+
+    def set_each(self, speeds, reason):
+        """Motor test: speeds is one speed per motor, in MOTORS order."""
+        speeds = dict(zip(MOTORS, speeds))
+        self._apply(speeds, " ".join(f"{name}={v:+.2f}" for name, v in speeds.items()), reason)
+
+    def _apply(self, speeds, text, reason):
+        with self.lock:  # called from the drive thread and from main() at exit
+            if speeds == self.speeds:
+                return  # held keys repeat the same command 10 times a second
+            self.speeds = speeds
+            for name, speed in speeds.items():
+                if name in self.steppers:
+                    self.steppers[name].set_speed(speed)
+            label = "drive" if any(speeds.values()) else "STOP "
+            print(f"{label}  {text}   ({reason})", flush=True)
 
 
 def parse(packet):
-    """Return (left, right, seq) from a packet, or raise ValueError."""
+    """Return (seq, speeds) from a packet: speeds is (left, right), or a list with one per motor."""
     try:
         msg = json.loads(packet)
-        seq, left, right = int(msg["seq"]), float(msg["l"]), float(msg["r"])
+        seq = int(msg["seq"])
+        if "m" in msg:
+            speeds = [float(v) for v in msg["m"]]
+            if len(speeds) != len(MOTORS):
+                raise ValueError(f"expected {len(MOTORS)} motor speeds")
+        else:
+            speeds = (float(msg["l"]), float(msg["r"]))
     except (ValueError, KeyError, TypeError) as e:
-        raise ValueError(f"bad packet {packet[:60]!r}") from e
-    if not all(math.isfinite(v) and -1 <= v <= 1 for v in (left, right)):
-        raise ValueError(f"speeds out of range: {packet[:60]!r}")
-    return left, right, seq
+        raise ValueError(f"bad packet {packet[:80]!r}") from e
+    if not all(math.isfinite(v) and -1 <= v <= 1 for v in speeds):
+        raise ValueError(f"speeds out of range: {packet[:80]!r}")
+    return seq, speeds
 
 
 def drive_listener(port, motors):
@@ -167,13 +346,17 @@ def drive_listener(port, motors):
     while True:
         try:
             packet, sender = sock.recvfrom(256)
-            left, right, seq = parse(packet)
+            seq, speeds = parse(packet)
         except socket.timeout:
             pass
         except ValueError as e:
             print(f"ignored packet from {sender[0]}: {e}", flush=True)
         else:
-            motors.set(left, right, f"seq {seq} from {sender[0]}")
+            reason = f"seq {seq} from {sender[0]}"
+            if isinstance(speeds, list):
+                motors.set_each(speeds, reason)
+            else:
+                motors.set(*speeds, reason)
             last_command = time.monotonic()
         if last_command is not None and time.monotonic() - last_command > DRIVE_TIMEOUT:
             motors.set(0, 0, f"no command for {DRIVE_TIMEOUT} s")

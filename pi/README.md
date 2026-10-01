@@ -89,8 +89,21 @@ Join the `weedbot` Wi-Fi (password `ajumpahotspot`), then open <http://10.42.0.1
 ## 4. Drive commands (WASD)
 
 `pi_server.py` also listens for drive commands from `dashboard.py`: UDP packets on port 9000.
-If no command arrives for 0.5 s, it stops the motors. The motors aren't wired yet: for now it prints
-each change, visible with `journalctl -u weedbot-camera -f`.
+If no command arrives for 0.5 s, it stops the motors. It prints each change, visible with
+`journalctl -u weedbot-camera -f`.
+
+Motors are four 28BYJ-48 steppers (M1-M4) on ULN2003 boards. Their pins, which side each follows,
+direction flips and speeds are in `MOTORS` and the constants next to it in `pi_server.py`. For
+bench tests, tick **Motor test** in the dashboard: W/A/S/D then run M1/M2/M3/M4 forward, each on
+its own. The GPIO device needs root, so the service (not root) only prints. Test by hand as root:
+
+```bash
+sudo systemctl stop weedbot-camera
+sudo python3 /opt/weedbot/pi_server.py /dev/ttyACM0 8000 9000
+```
+
+It should print `motors on /dev/gpiochip0: M1, M2, M3, M4`. `no motor output, ...` means GPIO couldn't be opened; the
+message says why.
 
 Run `dashboard.py` on the laptop and drive with W/A/S/D (Space stops). The Pi prints lines like
 `drive  L=+0.50 R=+0.50   (seq 12 from 10.42.0.x)`. Checks:
